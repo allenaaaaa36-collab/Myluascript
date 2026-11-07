@@ -1,0 +1,216 @@
+-- FPS boost.
+local function createFPSController(onChanged)
+    local Lighting = game:GetService("Lighting")
+    local MaterialService = game:GetService("MaterialService")
+    local f = {enabled = false, busy = false, changedProperties = 0, textures = 0, stoppedTracks = 0}
+    local records, touched, connections, watchedAnimators = {}, {}, {}, {}
+    local watchedProperties, stoppedTracks = {}, {}
+    local worker, generation = nil, 0
+    local function notify() if onChanged then onChanged(f) end end
+    local function change(object, property, value)
+        local ok, old = pcall(function() return object[property] end)
+        if not ok or old == value then return false end
+        local keys = touched[object]
+        if not keys then keys = {} touched[object] = keys end
+        local success = pcall(function() object[property] = value end)
+        if not success then return false end
+        local record = keys[property]
+        if not record then
+            record = {object = object, property = property, old = old, applied = value}
+            keys[property] = record
+            records[#records + 1] = record
+            f.changedProperties += 1
+        else
+            -- Keep the latest game-assigned appearance when an asset finishes loading.
+            -- Our own writes do not reach this branch because old already equals value.
+            record.old, record.applied = old, value
+        end
+        return true
+    end
+    local function enforceProperty(object, property, value, isTexture)
+        local properties = watchedProperties[object]
+        if not properties then properties = {} watchedProperties[object] = properties end
+        if not properties[property] then
+            local version, writing = generation, false
+            local ok, connection = pcall(function()
+                return object:GetPropertyChangedSignal(property):Connect(function()
+                    if not f.enabled or generation ~= version or writing then return end
+                    writing = true
+                    if change(object, property, value) and isTexture then f.textures += 1 end
+                    writing = false
+                end)
+            end)
+            if ok then
+                properties[property] = connection
+                connections[#connections + 1] = connection
+            end
+        end
+        if change(object, property, value) and isTexture then f.textures += 1 end
+    end
+    local function disconnectAll()
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        connections = {}
+    end
+    local function stopTrack(track, animator)
+        if not f.enabled then return end
+        local ok, snapshot = pcall(function()
+            if not track.IsPlaying then return nil end
+            return {track = track, animator = animator, position = track.TimePosition,
+                speed = track.Speed, weight = track.WeightTarget}
+        end)
+        if ok and snapshot and pcall(track.Stop, track, 0) then
+            stoppedTracks[track] = snapshot
+            f.stoppedTracks += 1
+        end
+    end
+    local function apply(object)
+        if not f.enabled then return end
+        if object:IsA("BasePart") and not object:IsA("Terrain") then
+            -- Changing visual materials must not change the original physical properties.
+            if object.Material ~= Enum.Material.SmoothPlastic then
+                change(object, "CustomPhysicalProperties", object.CurrentPhysicalProperties)
+                change(object, "Material", Enum.Material.SmoothPlastic)
+            end
+            enforceProperty(object, "MaterialVariant", "")
+            change(object, "Reflectance", 0)
+            change(object, "CastShadow", false)
+            if object:IsA("MeshPart") then enforceProperty(object, "TextureID", "", true) end
+            if object:IsA("UnionOperation") then change(object, "UsePartColor", true) end
+        elseif object:IsA("SurfaceAppearance") then
+            -- PBR maps override MeshPart.TextureID and most maps cannot be changed at runtime.
+            if change(object, "Parent", nil) then f.textures += 1 end
+        elseif object:IsA("Decal") or object:IsA("Texture") then
+            if change(object, "Parent", nil) then f.textures += 1 end
+        elseif object:IsA("FileMesh") then
+            enforceProperty(object, "TextureId", "", true)
+        elseif object:IsA("Shirt") then
+            enforceProperty(object, "ShirtTemplate", "", true)
+        elseif object:IsA("Pants") then
+            enforceProperty(object, "PantsTemplate", "", true)
+        elseif object:IsA("ShirtGraphic") then
+            enforceProperty(object, "Graphic", "", true)
+        elseif object:IsA("ParticleEmitter") or object:IsA("Trail") or object:IsA("Beam")
+            or object:IsA("Smoke") or object:IsA("Fire") or object:IsA("Sparkles")
+            or object:IsA("Light") or object:IsA("PostEffect") or object:IsA("Highlight") then
+            enforceProperty(object, "Enabled", false)
+            if object:IsA("ParticleEmitter") then pcall(object.Clear, object) end
+        elseif object:IsA("Explosion") then
+            enforceProperty(object, "Visible", false)
+        elseif object:IsA("Sky") or object:IsA("Atmosphere") or object:IsA("Clouds") then
+            change(object, "Parent", nil)
+        elseif object:IsA("Animator") and not watchedAnimators[object] then
+            watchedAnimators[object] = true
+            local version = generation
+            -- Listen before taking the snapshot so playback started during setup is caught.
+            connections[#connections + 1] = object.AnimationPlayed:Connect(function(track)
+                if generation == version then stopTrack(track, object) end
+            end)
+            local ok, tracks = pcall(object.GetPlayingAnimationTracks, object)
+            if ok then
+                for _, track in ipairs(tracks) do stopTrack(track, object) end
+            end
+        end
+    end
+    local selector = "BasePart, SurfaceAppearance, Decal, Texture, FileMesh, Shirt, Pants, ShirtGraphic, "
+        .. "ParticleEmitter, Trail, Beam, Smoke, Fire, Sparkles, Light, PostEffect, Highlight, "
+        .. "Explosion, Sky, Atmosphere, Clouds, Animator"
+    function f:setEnabled(value)
+        value = value == true
+        if value == self.enabled then return end
+        generation += 1
+        local version = generation
+        self.enabled, self.busy = value, false
+        if worker then pcall(task.cancel, worker) worker = nil end
+        disconnectAll()
+        if not value then
+            -- Restore detached appearance objects only if their original parent still exists.
+            for i = #records, 1, -1 do
+                local record = records[i]
+                pcall(function()
+                    if record.property == "Parent" and record.old and record.old.Parent == nil then return end
+                    if record.object[record.property] == record.applied then
+                        record.object[record.property] = record.old
+                    end
+                end)
+            end
+            for _, snapshot in pairs(stoppedTracks) do
+                pcall(function()
+                    if not snapshot.animator:IsDescendantOf(workspace) or snapshot.track.IsPlaying then return end
+                    snapshot.track:Play(0, snapshot.weight, snapshot.speed)
+                    snapshot.track.TimePosition = snapshot.position
+                end)
+            end
+            records, touched, watchedAnimators, watchedProperties, stoppedTracks = {}, {}, {}, {}, {}
+            if self.renderSettings and self.previousQuality then
+                pcall(function()
+                    if self.renderSettings.QualityLevel == Enum.QualityLevel.Level01 then
+                        self.renderSettings.QualityLevel = self.previousQuality
+                    end
+                end)
+            end
+            self.renderSettings, self.previousQuality = nil, nil
+            if self.materialOverride ~= nil then
+                pcall(function()
+                    if MaterialService:GetBaseMaterialOverride(Enum.Material.SmoothPlastic) == "" then
+                        MaterialService:SetBaseMaterialOverride(Enum.Material.SmoothPlastic, self.materialOverride)
+                    end
+                end)
+                self.materialOverride = nil
+            end
+            notify()
+            return
+        end
+        self.changedProperties, self.textures, self.stoppedTracks = 0, 0, 0
+        self.busy = true
+        change(Lighting, "GlobalShadows", false)
+        change(Lighting, "EnvironmentDiffuseScale", 0)
+        change(Lighting, "EnvironmentSpecularScale", 0)
+        change(workspace.Terrain, "WaterWaveSize", 0)
+        change(workspace.Terrain, "WaterWaveSpeed", 0)
+        change(workspace.Terrain, "WaterReflectance", 0)
+        change(workspace.Terrain, "Decoration", false)
+        local qualityOk, rendering = pcall(function() return settings().Rendering end)
+        if qualityOk then
+            local setOk = pcall(function()
+                self.previousQuality = rendering.QualityLevel
+                rendering.QualityLevel = Enum.QualityLevel.Level01
+            end)
+            if setOk then self.renderSettings = rendering end
+        end
+        local overrideOk, materialOverride = pcall(MaterialService.GetBaseMaterialOverride, MaterialService, Enum.Material.SmoothPlastic)
+        if overrideOk then
+            self.materialOverride = materialOverride
+            pcall(MaterialService.SetBaseMaterialOverride, MaterialService, Enum.Material.SmoothPlastic, "")
+        end
+        connections[#connections + 1] = workspace.DescendantAdded:Connect(apply)
+        connections[#connections + 1] = Lighting.DescendantAdded:Connect(apply)
+        notify()
+        worker = task.defer(function()
+            local objects = workspace:QueryDescendants(selector)
+            local lightingObjects = Lighting:QueryDescendants(selector)
+            for _, object in ipairs(lightingObjects) do objects[#objects + 1] = object end
+            for i, object in ipairs(objects) do
+                if not self.enabled or generation ~= version then return end
+                apply(object)
+                if i % 180 == 0 then task.wait() end
+            end
+            if self.enabled and generation == version then
+                self.busy, worker = false, nil
+                notify()
+            end
+        end)
+    end
+    function f:stop() self:setEnabled(false) end
+    return f
+end
+
+--[[ Usage:
+local fps = createFPSController(function(f)
+    -- called whenever state changes: f.enabled, f.busy, f.textures,
+    -- f.changedProperties, f.stoppedTracks
+    print("FPS Boost", f.enabled, f.busy)
+end)
+fps:setEnabled(true)   -- turn on
+fps:setEnabled(false)  -- turn off and restore everything
+fps:stop()             -- same as turning off (call on script shutdown)
+]]
